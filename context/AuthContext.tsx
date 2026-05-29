@@ -1,7 +1,7 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
 
 import { isSupabaseEnabled, supabase } from '@/lib/supabase';
+import { getItem, removeItem, setItem } from '@/lib/storage';
 
 type AuthMode = 'local' | 'cloud';
 
@@ -37,7 +37,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   useEffect(() => {
     async function loadAuth() {
       try {
-        const raw = await AsyncStorage.getItem(AUTH_KEY);
+        const raw = await getItem(AUTH_KEY);
         if (raw) {
           const parsed = JSON.parse(raw) as LocalAuthRecord;
           setUserName(parsed.userName ?? '');
@@ -52,7 +52,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   async function writeLocalAuth(record: LocalAuthRecord) {
-    await AsyncStorage.setItem(AUTH_KEY, JSON.stringify(record));
+    await setItem(AUTH_KEY, JSON.stringify(record));
     setUserName(record.userName);
     setUserId(record.userId);
   }
@@ -118,7 +118,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     if (isSupabaseEnabled && supabase) {
       await supabase.auth.signOut();
     }
-    await AsyncStorage.removeItem(AUTH_KEY);
+    await removeItem(AUTH_KEY);
     setUserName('');
     setUserId('');
   }

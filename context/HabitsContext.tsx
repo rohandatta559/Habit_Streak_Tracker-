@@ -1,6 +1,6 @@
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import * as Notifications from 'expo-notifications';
 import React, { createContext, useContext, useEffect, useMemo, useState } from 'react';
+import { getItem, setItem } from '@/lib/storage';
 import { Platform } from 'react-native';
 
 import { useAuth } from '@/context/AuthContext';
@@ -21,6 +21,11 @@ type GameState = {
   lastQuestClaimDate: string;
   achievements: string[];
   challenges: ChallengeState;
+  perkLevels: {
+    xpBoost: number;
+    questMultiplier: number;
+    freezeCapacity: number;
+  };
 };
 
 type HabitsContextType = {
@@ -35,6 +40,7 @@ type HabitsContextType = {
   deleteHabit: (habitId: string) => Promise<void>;
   claimDailyQuest: () => Promise<{ ok: boolean; message: string }>;
   useStreakFreeze: () => Promise<{ ok: boolean; message: string }>;
+  purchasePerk: (perk: 'xpBoost' | 'questMultiplier' | 'freezeCapacity') => Promise<{ ok: boolean; message: string }>;
 };
 
 const STORAGE_KEY = 'habit.items';
@@ -51,6 +57,11 @@ const DEFAULT_GAME: GameState = {
     sevenDayProgress: 0,
     thirtyDayStart: getTodayKey(),
     thirtyDayProgress: 0,
+  },
+  perkLevels: {
+    xpBoost: 0,
+    questMultiplier: 0,
+    freezeCapacity: 0,
   },
 };
 
@@ -96,7 +107,12 @@ function mergeAchievements(game: GameState, habits: Habit[], completedToday: num
   if (game.level >= 3) next.add('Level 3 Reached');
   if (game.challenges.sevenDayProgress >= 7) next.add('7-Day Challenge Complete');
   if (game.challenges.thirtyDayProgress >= 30) next.add('30-Day Challenge Complete');
+  if (game.perkLevels.xpBoost > 0) next.add('Perk Buyer');
   return [...next];
+}
+
+function perkCost(level: number): number {
+  return 120 + level * 80;
 }
 
 function updateChallenges(baseGame: GameState, totalCompletedToday: number): GameState {
@@ -173,8 +189,8 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
 
       try {
         const [habitsRaw, gameRaw] = await Promise.all([
-          AsyncStorage.getItem(`${STORAGE_KEY}.${userId}`),
-          AsyncStorage.getItem(`${GAME_STORAGE_KEY}.${userId}`),
+          getItem(`${STORAGE_KEY}.${userId}`),
+          getItem(`${GAME_STORAGE_KEY}.${userId}`),
         ]);
 
         if (habitsRaw) {
@@ -196,7 +212,7 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
           if (data?.payload) {
             const cloudHabits = data.payload as Habit[];
             setHabits(cloudHabits);
-            await AsyncStorage.setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(cloudHabits));
+            await setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(cloudHabits));
           }
         }
       } finally {
@@ -213,7 +229,7 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
       return;
     }
 
-    await AsyncStorage.setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(nextHabits));
+    await setItem(`${STORAGE_KEY}.${userId}`, JSON.stringify(nextHabits));
 
     if (isSupabaseEnabled && supabase) {
       await supabase.from('habits').upsert({ user_id: userId, payload: nextHabits }, { onConflict: 'user_id' });
@@ -225,11 +241,12 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
     if (!userId) {
       return;
     }
-    await AsyncStorage.setItem(`${GAME_STORAGE_KEY}.${userId}`, JSON.stringify(nextGame));
+    await setItem(`${GAME_STORAGE_KEY}.${userId}`, JSON.stringify(nextGame));
   }
 
   async function addXp(amount: number, sourceHabits = habits, completedToday = totalCompletedToday) {
-    const nextXp = game.xp + amount;
+    const boostedAmount = Math.round(amount * (1 + game.perkLevels.xpBoost * 0.1));
+    const nextXp = game.xp + boostedAmount;
     const nextLevel = levelFromXp(nextXp);
     let baseGame: GameState = {
       ...game,
@@ -340,20 +357,21 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
       return { ok: false, message: 'Daily quest already claimed today.' };
     }
 
-    const nextXp = game.xp + 50;
+    const questReward = 50 + game.perkLevels.questMultiplier * 20;
+    const nextXp = game.xp + questReward;
     const nextLevel = levelFromXp(nextXp);
     let nextGame: GameState = {
       ...game,
       xp: nextXp,
       level: nextLevel,
-      streakFreezes: game.streakFreezes + 1,
+      streakFreezes: Math.min(game.streakFreezes + 1, 1 + game.perkLevels.freezeCapacity),
       lastQuestClaimDate: todayKey,
     };
     nextGame = updateChallenges(nextGame, totalCompletedToday);
     nextGame.achievements = mergeAchievements(nextGame, habits, totalCompletedToday);
     await persistGame(nextGame);
 
-    return { ok: true, message: 'Quest claimed: +50 XP and +1 Streak Freeze.' };
+    return { ok: true, message: `Quest claimed: +${questReward} XP and +1 Streak Freeze.` };
   }
 
   async function useStreakFreeze() {
@@ -400,6 +418,37 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
     return { ok: true, message: `Rescued '${rescueTarget.name}' from yesterday. +${xpGain} XP` };
   }
 
+  async function purchasePerk(perk: 'xpBoost' | 'questMultiplier' | 'freezeCapacity') {
+    const currentLevel = game.perkLevels[perk];
+    if (currentLevel >= 5) {
+      return { ok: false, message: 'This perk is already maxed.' };
+    }
+
+    const cost = perkCost(currentLevel);
+    if (game.xp < cost) {
+      return { ok: false, message: `Not enough XP. Need ${cost}.` };
+    }
+
+    const nextPerkLevels = {
+      ...game.perkLevels,
+      [perk]: currentLevel + 1,
+    };
+    let nextGame: GameState = {
+      ...game,
+      xp: game.xp - cost,
+      level: levelFromXp(game.xp - cost),
+      perkLevels: nextPerkLevels,
+    };
+
+    if (perk === 'freezeCapacity') {
+      nextGame.streakFreezes = Math.min(nextGame.streakFreezes + 1, 1 + nextPerkLevels.freezeCapacity);
+    }
+
+    nextGame.achievements = mergeAchievements(nextGame, habits, totalCompletedToday);
+    await persistGame(nextGame);
+    return { ok: true, message: `Perk upgraded (${perk}) to level ${currentLevel + 1}.` };
+  }
+
   const value = useMemo(
     () => ({
       isLoading,
@@ -413,6 +462,7 @@ export function HabitsProvider({ children }: { children: React.ReactNode }) {
       deleteHabit,
       claimDailyQuest,
       useStreakFreeze,
+      purchasePerk,
     }),
     [isLoading, habits, game, totalScheduledToday, totalCompletedToday]
   );
